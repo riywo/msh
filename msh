@@ -1,0 +1,107 @@
+#!/usr/bin/env python
+import os
+import sys
+import time
+import threading
+import argparse
+from Queue import Queue
+import mesos
+import mesos_pb2
+
+framework = mesos_pb2.FrameworkInfo()
+framework.user = "root"
+framework.name = "Msh"
+
+MASTER = 'zk://localhost:2181/mesos'
+CPUS   = 1
+MEM    = 100
+
+def main():
+  args   = parser().parse_args()
+  driver = mesos.MesosSchedulerDriver(MshScheduler(args), framework, args.master)
+  sys.exit(0 if driver.run() == mesos_pb2.DRIVER_STOPPED else 1)
+
+def parser():
+  parser = argparse.ArgumentParser(
+    description='Mesos shell',
+    formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+  parser.add_argument('command', nargs='+', help='Commmand to be run on Mesos slave')
+  parser.add_argument('--master', help='Mesos mater URL')
+  parser.add_argument('-c', '--cpus', help='CPU')
+  parser.add_argument('-m', '--mem', help='Memory')
+  parser.set_defaults(master=MASTER, cpus=CPUS, mem=MEM)
+  return parser
+
+class MshScheduler(mesos.Scheduler):
+  def __init__(self, args):
+    self.args  = args
+    self.queue = Queue()
+    self.running = False
+
+    def reader():
+      while True:
+        line = self.queue.get()
+        if line == "EOF":
+          break
+        else:
+          print line
+
+    def writer():
+      for line in iter(sys.stdin.readline, ""):
+        self.sendFrameworkMessage(line)
+      self.sendFrameworkMessage('EOF')
+
+    self.reader = threading.Thread(target=reader)
+    self.writer = threading.Thread(target=writer)
+
+  def statusUpdate(self, driver, update):
+    if   update.state == mesos_pb2.TASK_RUNNING:
+      self.reader.start()
+      self.writer.start()
+    elif update.state == mesos_pb2.TASK_FINISHED:
+      driver.stop()
+
+  def frameworkMessage(self, driver, executorId, slaveId, message):
+    self.queue.put(message)
+
+  def resourceOffers(self, driver, offers):
+    if self.running != True:
+      for offer in offers:
+        task = self.makeTask(offer)
+        if task != None:
+          self.running = True
+          self.driver = driver
+          self.slaveId = offer.slave_id
+          self.executorId = task.executor.executor_id
+          driver.launchTasks(offer.id, [task])
+          return
+
+  def makeTask(self, offer):
+    command = " ".join(self.args.command)
+    executor = mesos_pb2.ExecutorInfo()
+    executor.executor_id.value = "Msh-executor"
+    executor.command.value = os.path.abspath("./msh-executor") + " " + command
+    executor.name = "Msh executor"
+
+    task = mesos_pb2.TaskInfo()
+    task.task_id.value = "Msh-task"
+    task.slave_id.value = offer.slave_id.value
+    task.name = "command: %s" % command
+    task.executor.MergeFrom(executor)
+
+    cpus = task.resources.add()
+    cpus.name = "cpus"
+    cpus.type = mesos_pb2.Value.SCALAR
+    cpus.scalar.value = self.args.cpus
+
+    mem = task.resources.add()
+    mem.name = "mem"
+    mem.type = mesos_pb2.Value.SCALAR
+    mem.scalar.value = self.args.mem
+    return task
+
+  def sendFrameworkMessage(self, message):
+    self.driver.sendFrameworkMessage(self.executorId, self.slaveId, message)
+
+if __name__ == "__main__":
+  main()
